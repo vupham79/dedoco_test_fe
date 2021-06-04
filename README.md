@@ -1,3 +1,12 @@
+<div align="center">
+  <img width="250" src="https://logos-download.com/wp-content/uploads/2016/09/React_logo_wordmark.png" alt="Awesome">
+  <br>
+  <h3>Dedoco Test - Frontend</h3>
+  <hr>
+</div>
+
+# Start Guide
+
 ### Configure Firebase
 
 Open `src/utilities/constants.js` and provide your Firebase Storage Configuration.
