@@ -6,9 +6,9 @@ import CssBaseline from '@material-ui/core/CssBaseline';
 import { makeStyles } from '@material-ui/core/styles';
 import TextField from '@material-ui/core/TextField';
 import { DataUsage } from '@material-ui/icons';
-import { PDFDocument, rgb } from 'pdf-lib';
+import WebViewer from '@pdftron/webviewer';
 import queryString from 'query-string';
-import React, { useEffect, useReducer, useState } from 'react';
+import React, { useEffect, useReducer, useRef, useState } from 'react';
 import { useHistory } from 'react-router';
 import { instance } from '../../utilities/axios';
 import storage from '../../utilities/firebase';
@@ -33,20 +33,30 @@ const useStyles = makeStyles((theme) => ({
   },
 }));
 
-export default function Document() {
+export default function DocumentPage() {
   let history = useHistory();
   const { id, secret } = queryString.parse(window.location.search);
   const classes = useStyles();
   const [signingDocument, setSigningDocument] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [fileBytes, setFileBytes] = useState(null);
-  const [pdfInfo, setPdfInfo] = useState(null);
   const [formInput, setFormInput] = useReducer(
     (state, newState) => ({ ...state, ...newState }),
     {}
   );
-
+  const viewer = useRef(null);
+  const [webviewerInstance, setWebviewerInstance] = useState(null);
   useEffect(() => {
+    if (!webviewerInstance) {
+      WebViewer(
+        {
+          showLocalFilePicker: true,
+          fullAPI: true,
+          path: '/webviewer/lib',
+        },
+        viewer.current
+      ).then((i) => setWebviewerInstance(i));
+    }
+
     if (id && secret) {
       instance
         .get('/api/v1/documents', {
@@ -58,14 +68,63 @@ export default function Document() {
         .then((res) => {
           if (res.data) {
             setSigningDocument(res.data);
-            setPdfInfo(res.data.originalDocumentUrl);
+            console.log(res.data.originalDocumentUrl);
+            webviewerInstance.loadDocument(res.data.originalDocumentUrl);
+            const { docViewer, Annotations } = webviewerInstance;
+            const { WidgetFlags } = Annotations;
+            const annotManager = docViewer.getAnnotationManager();
+            docViewer.on('documentLoaded', async () => {});
+            // set flags for required
+            const flags = new WidgetFlags();
+            flags.set('Required', true);
+
+            // create a form field
+            const field = new Annotations.Forms.Field(
+              'some signature field name',
+              {
+                type: 'Sig',
+                flags,
+              }
+            );
+
+            // create a widget annotation
+            const widgetAnnot = new Annotations.SignatureWidgetAnnotation(
+              field,
+              {
+                appearance: '_DEFAULT',
+                appearances: {
+                  _DEFAULT: {
+                    Normal: {
+                      data: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAYdEVYdFNvZnR3YXJlAHBhaW50Lm5ldCA0LjEuMWMqnEsAAAANSURBVBhXY/j//z8DAAj8Av6IXwbgAAAAAElFTkSuQmCC',
+                      offset: {
+                        x: 100,
+                        y: 100,
+                      },
+                    },
+                  },
+                },
+              }
+            );
+
+            // set position and size
+            widgetAnnot.X = 200;
+            widgetAnnot.Y = 300;
+            widgetAnnot.Width = 200;
+            widgetAnnot.Height = 100;
+
+            //add the form field and widget annotation
+            annotManager.addAnnotation(widgetAnnot);
+            annotManager.drawAnnotationsFromList([widgetAnnot]);
+            annotManager.getFieldManager().addField(field);
           } else {
             alert('Document could be signed !');
           }
         })
         .catch(() => {});
+    } else if (!instance.defaults.headers.common['Authorization']) {
+      history.replace('/');
     }
-  }, [id, secret]);
+  }, [id, secret, webviewerInstance]);
 
   const handleInput = (evt) => {
     let name = evt.target.name;
@@ -81,26 +140,50 @@ export default function Document() {
     } else setFormInput({ [name]: newValue });
   };
 
-  const handleSumbit = (e) => {
+  const handleSumbit = async (e) => {
     setLoading(true);
     e.preventDefault();
     if (signingDocument) {
-      instance
-        .post('/api/v1/documents/sign', {
-          ...signingDocument,
-          signedDocumentUrl: signingDocument.originalDocumentUrl,
-        })
-        .then(() => {
-          alert('Sign success');
-          history.replace('/document');
-        })
-        .catch(() => {
-          alert('Sign error');
+      const { docViewer, annotManager } = webviewerInstance;
+      const doc = docViewer.getDocument();
+      const xfdfString = await annotManager.exportAnnotations();
+      const options = { xfdfString };
+      const data = await doc.getFileData(options);
+      const arr = new Uint8Array(data);
+      const blob = new Blob([arr], { type: 'application/pdf' });
+      storage
+        .ref(`/pdf/${signingDocument.filename}_signed.pdf`)
+        .put(blob)
+        .on('state_changed', async (res) => {
+          const downloadUrl = await res.ref.getDownloadURL();
+          instance
+            .post('/api/v1/documents/sign', {
+              ...signingDocument,
+              signedDocumentUrl: downloadUrl,
+            })
+            .then(() => {
+              alert('Sign success');
+              history.replace('/document');
+            })
+            .catch(() => {
+              alert('Sign error');
+              setLoading(false);
+            });
           setLoading(false);
         });
     } else {
       instance
-        .post('/api/v1/documents', formInput)
+        .post('/api/v1/documents', {
+          ...formInput,
+          tagSignatureLocations: [
+            {
+              x: 200,
+              y: 300,
+              width: 200,
+              height: 100,
+            },
+          ],
+        })
         .then(() => {
           alert('Request success');
           setLoading(false);
@@ -112,59 +195,63 @@ export default function Document() {
     }
   };
 
-  const modifyPdf = async () => {
-    if (fileBytes) {
-      console.log('heehheeh');
-      const pdfDoc = await PDFDocument.load(fileBytes);
-      const pages = pdfDoc.getPages();
-      const firstPage = pages[0];
-
-      // Get the width and height of the first page
-      const svgPath =
-        'M 0,20 L 100,160 Q 130,200 150,120 C 190,-40 200,200 300,150 L 400,90';
-      firstPage.moveTo(100, firstPage.getHeight() - 5);
-
-      // Draw the SVG path as a black line
-      firstPage.moveDown(25);
-      firstPage.drawSvgPath(svgPath);
-
-      // Draw the SVG path as a thick green line
-      firstPage.moveDown(200);
-      firstPage.drawSvgPath(svgPath, {
-        borderColor: rgb(0, 1, 0),
-        borderWidth: 5,
-      });
-
-      // Draw the SVG path and fill it with red
-      firstPage.moveDown(200);
-      firstPage.drawSvgPath(svgPath, { color: rgb(1, 0, 0) });
-
-      // Draw the SVG path at 50% of its original size
-      firstPage.moveDown(200);
-      firstPage.drawSvgPath(svgPath, { scale: 0.5 });
-
-      const pdfBytes = await pdfDoc.save();
-      const docUrl = URL.createObjectURL(
-        new Blob(pdfBytes, { type: 'application/pdf' })
-      );
-      setPdfInfo(docUrl);
-      window.open(docUrl);
-    }
-  };
-
   const handleChange = async (e) => {
+    setLoading(true);
     try {
       let reader = new FileReader();
       let file = e.target.files[0];
       reader.readAsArrayBuffer(file);
       reader.onload = async () => {
         var bytes = new Uint8Array(reader.result); // read the actual file contents
-        setFileBytes(bytes);
         var blob = new Blob([bytes], { type: 'application/pdf' });
         const docUrl = URL.createObjectURL(blob);
-        console.log(docUrl);
-        setPdfInfo(docUrl);
-        // modifyPdf();
+        webviewerInstance.loadDocument(docUrl);
+        const { docViewer, Annotations } = webviewerInstance;
+        const { WidgetFlags } = Annotations;
+        const annotManager = docViewer.getAnnotationManager();
+        docViewer.on('documentLoaded', async () => {});
+        document.getElementById('myBtn').addEventListener('click', () => {
+          // set flags for required
+          const flags = new WidgetFlags();
+          flags.set('Required', true);
+
+          // create a form field
+          const field = new Annotations.Forms.Field(
+            'some signature field name',
+            {
+              type: 'Sig',
+              flags,
+            }
+          );
+
+          // create a widget annotation
+          const widgetAnnot = new Annotations.SignatureWidgetAnnotation(field, {
+            appearance: '_DEFAULT',
+            appearances: {
+              _DEFAULT: {
+                Normal: {
+                  data: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAAYdEVYdFNvZnR3YXJlAHBhaW50Lm5ldCA0LjEuMWMqnEsAAAANSURBVBhXY/j//z8DAAj8Av6IXwbgAAAAAElFTkSuQmCC',
+                  offset: {
+                    x: 200,
+                    y: 100,
+                  },
+                },
+              },
+            },
+          });
+
+          // set position and size
+          widgetAnnot.PageNumber = 1;
+          widgetAnnot.X = 200;
+          widgetAnnot.Y = 300;
+          widgetAnnot.Width = 200;
+          widgetAnnot.Height = 100;
+
+          //add the form field and widget annotation
+          annotManager.addAnnotation(widgetAnnot);
+          annotManager.drawAnnotationsFromList([widgetAnnot]);
+          annotManager.getFieldManager().addField(field);
+        });
       };
       storage
         .ref(`/pdf/${file.name}`)
@@ -172,11 +259,14 @@ export default function Document() {
         .on('state_changed', async (res) => {
           const downloadUrl = await res.ref.getDownloadURL();
           setFormInput({
+            filename: file.name.replace('.pdf', ''),
             originalDocumentUrl: downloadUrl,
-            tagSignatureLocations: ['12.3333,30.222222'],
           });
+          setLoading(false);
         });
-    } catch (error) {}
+    } catch (error) {
+      setLoading(false);
+    }
   };
 
   return (
@@ -316,13 +406,10 @@ export default function Document() {
             </Grid>
           )}
           <Grid item lg={8}>
-            <iframe
-              height={'520px'}
-              width={'100%'}
-              title="test-frame"
-              src={pdfInfo}
-              type="application/pdf"
-            />
+            {!signingDocument && (
+              <Button id="myBtn">Tag Signature Location</Button>
+            )}
+            <div className="webviewer" ref={viewer}></div>
           </Grid>
         </Grid>
       </div>
